@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 from pathlib import Path
+from typing import List, Dict
 
 from src.utils.train_util import instantiate_from_config
 
@@ -59,30 +60,39 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
 class NeurokOverfitData(Dataset):
     def __init__(self,
-        root_dir='objaverse/',
-        meta_fname='valid_paths.json',
-        image_dir='rendering_zero123plus',
+        root_dir='data/table_seq_proc/multi_view',
         validation=False,
     ):
-        self.root_dir = Path(root_dir)
-        self.image_dir = image_dir
+        self.root_dir = root_dir
 
-        with open(os.path.join(root_dir, meta_fname)) as f:
-            lvis_dict = json.load(f)
-        paths = []
-        for k in lvis_dict.keys():
-            paths.extend(lvis_dict[k])
-        self.paths = paths
-            
-        total_objects = len(self.paths)
+        # Gather image paths for all frames
+        data = []
+        frame_dirs = sorted([os.path.join(root_dir, d) for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+        for frame_id, frame_dirs in enumerate(frame_dirs):
+            data.append([])
+            for view_id in range(6):
+                image_path_i = os.path.join(frame_dirs, f'{view_id:03d}.png')
+                data[-1].append(image_path_i)
+        self.data = data
+
+        # Construct training/inference pairs
+        data_length = len(self.data)
+        frame_indices = np.arange(data_length)
+        pairs = np.stack((
+            np.tile(frame_indices[None, :], (data_length, 1)),
+            np.tile(frame_indices[:, None], (1, data_length))
+        ), axis=-1).reshape(-1, 2)  # n_f * n_f, 2
+        breakpoint()  # TODO: check correctness
+        
         if validation:
-            self.paths = self.paths[-16:] # used last 16 as validation
+            self.pairs = pairs[::len(pairs) // 10]  # Uniformly sample 10 pairs for validation
         else:
-            self.paths = self.paths[:-16]
-        print('============= length of dataset %d =============' % len(self.paths))
+            self.pairs = pairs
+            
+        print('============= length of dataset %d =============' % len(self.pairs))
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.pairs)
 
     def load_im(self, path, color):
         pil_img = Image.open(path)
@@ -95,30 +105,36 @@ class NeurokOverfitData(Dataset):
         alpha = torch.from_numpy(alpha).permute(2, 0, 1).contiguous().float()
         return image, alpha
     
+    def load_frame(self, frame_paths: List[str]):
+        images, alphas = [], []
+        assert len(frame_paths) == 6
+        bkg_color = [1., 1., 1.]
+        for f_path in frame_paths:
+            img, alpha = self.load_im(os.path.join(self.root_dir, f_path), bkg_color)
+            images.append(img)
+            alphas.append(alpha)
+        return images, alphas
+    
     def __getitem__(self, index):
-        while True:
-            image_path = os.path.join(self.root_dir, self.image_dir, self.paths[index])
-
-            '''background color, default: white'''
-            bkg_color = [1., 1., 1.]
-
-            img_list = []
-            try:
-                for idx in range(7):
-                    img, alpha = self.load_im(os.path.join(image_path, '%03d.png' % idx), bkg_color)
-                    img_list.append(img)
-
-            except Exception as e:
-                print(e)
-                index = np.random.randint(0, len(self.paths))
-                continue
-
-            break
+        # Gather multi-view pair
+        pair = self.pairs[index]
+        fid_src, fid_tar = pair[0], pair[1]
         
-        imgs = torch.stack(img_list, dim=0).float()
+        image_paths_src = self.data[fid_src]  # A list of image paths
+        image_paths_tar = self.data[fid_tar]
+        
+        images_src, alphas_src = self.load_frame(image_paths_src)
+        images_tar, alphas_tar = self.load_frame(image_paths_tar)
+        
+        images_src_f = torch.stack(images_src, dim=0).float()  # (6, 3, H, W)
+        images_tar_f = torch.stack(images_tar, dim=0).float()  # (6, 3, H, W)
+        breakpoint()  # TODO: check dim correctness
 
         data = {
-            'cond_imgs': imgs[0],           # (3, H, W)
-            'target_imgs': imgs[1:],        # (6, 3, H, W)
+            'src_frame_id': fid_src,
+            'tar_frame_id': fid_tar,
+            'src_images': images_src_f,     # (6, 3, H, W)
+            'tar_images': images_tar_f,     # (6, 3, H, W)
         }
+
         return data
